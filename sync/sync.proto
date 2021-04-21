@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+option go_package = "github.com/smartcontractkit/chainlink/sync/sync";
+
+package sync;
+
+// Interface exported by the server.
+service Sync {
+  // A Bidirectional streaming RPC.
+  rpc ServerStream(stream Request) returns (stream Request) {}
+}
+
+message Request {
+  // The message to be sent.
+  string message = 1;
+}
