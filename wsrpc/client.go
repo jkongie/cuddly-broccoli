@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"time"
 )
 
@@ -151,14 +152,26 @@ func Dial(target string, opts ...DialOption) (conn *ClientConn, err error) {
 		}),
 	}
 
-	tlsConn, err := tls.Dial("tcp", target, &config)
-	if err != nil {
-		log.Println("error")
-		log.Println(err)
-		return
+	t := &http.Transport{
+		TLSClientConfig: &config,
 	}
 
-	handleConnection(tlsConn)
+	client := http.Client{Transport: t, Timeout: 15 * time.Second}
+
+	res, err := client.Get("https://" + target + "/")
+	if err != nil {
+		log.Fatalln(err)
+	}
+	fmt.Println("Send Request", res)
+
+	// tlsConn, err := tls.Dial("tcp", target, &config)
+	// if err != nil {
+	// 	log.Println("error")
+	// 	log.Println(err)
+	// 	return
+	// }
+
+	// handleConnection(tlsConn)
 
 	return cc, nil
 }

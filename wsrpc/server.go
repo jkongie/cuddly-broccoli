@@ -6,8 +6,10 @@ package wsrpc
 import (
 	"crypto/ed25519"
 	"crypto/tls"
+	"fmt"
 	"log"
 	"net"
+	"net/http"
 )
 
 // A ServerOption sets options such as credentials, codec and keepalive parameters, etc.
@@ -70,7 +72,7 @@ func NewServer(opt ...ServerOption) *Server {
 }
 
 func (s *Server) Serve(lis net.Listener) {
-	defer lis.Close()
+	// defer lis.Close()
 
 	cert := newMinimalX509CertFromPrivateKey(s.opts.privKey)
 
@@ -88,17 +90,30 @@ func (s *Server) Serve(lis net.Listener) {
 		VerifyPeerCertificate: verifyCertMatchesIdentity(s.opts.clientIdentities),
 	}
 
-	for {
-		conn, err := lis.Accept()
-		if err != nil {
-			log.Println(err)
-			continue
-		}
-
-		tlsConn := tls.Server(conn, &tlsConfig)
-
-		go s.acceptClient(tlsConn)
+	httpsrv := &http.Server{
+		TLSConfig: &tlsConfig,
 	}
+
+	http.HandleFunc("/", wshandler)
+
+	// The TLS config is store on the http.Server struct
+	httpsrv.ServeTLS(lis, "", "")
+
+	// for {
+	// 	conn, err := lis.Accept()
+	// 	if err != nil {
+	// 		log.Println(err)
+	// 		continue
+	// 	}
+
+	// 	tlsConn := tls.Server(conn, &tlsConfig)
+
+	// 	go s.acceptClient(tlsConn)
+	// }
+}
+
+func wshandler(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintf(w, "Hello World")
 }
 
 func (s *Server) acceptClient(conn net.Conn) {
