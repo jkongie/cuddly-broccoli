@@ -10,6 +10,9 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 // A ServerOption sets options such as credentials, codec and keepalive parameters, etc.
@@ -72,8 +75,6 @@ func NewServer(opt ...ServerOption) *Server {
 }
 
 func (s *Server) Serve(lis net.Listener) {
-	// defer lis.Close()
-
 	cert := newMinimalX509CertFromPrivateKey(s.opts.privKey)
 
 	tlsConfig := tls.Config{
@@ -93,65 +94,59 @@ func (s *Server) Serve(lis net.Listener) {
 	httpsrv := &http.Server{
 		TLSConfig: &tlsConfig,
 	}
-
 	http.HandleFunc("/", wshandler)
 
 	// The TLS config is store on the http.Server struct
 	httpsrv.ServeTLS(lis, "", "")
+}
 
-	// for {
-	// 	conn, err := lis.Accept()
-	// 	if err != nil {
-	// 		log.Println(err)
-	// 		continue
-	// 	}
-
-	// 	tlsConn := tls.Server(conn, &tlsConfig)
-
-	// 	go s.acceptClient(tlsConn)
-	// }
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:   1024,
+	WriteBufferSize:  1024,
+	HandshakeTimeout: 45 * time.Second,
 }
 
 func wshandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, "Hello World")
-}
-
-func (s *Server) acceptClient(conn net.Conn) {
-	defer conn.Close()
-
-	// Cast to *tls.Conn so we have access to TLS specific functions
-	tlsConn := conn.(*tls.Conn)
-
-	// Perform handshake so that we know the public key
-	if err := tlsConn.Handshake(); err != nil {
-		log.Printf("Closing connection, error during handshake: %v", err)
-		return
-	}
-
-	// Get client name from public key
-	pk, err := pubKeyFromCert(tlsConn.ConnectionState().PeerCertificates[0])
+	fmt.Println("Establishing Websocket connection")
+	c, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("Closing connection, error getting public key of client: %v", err)
+		log.Print("upgrade:", err)
 		return
 	}
-	name, ok := s.opts.clientIdentities[pk]
-	if !ok {
-		log.Print("Closing connection, client uses unknown public key")
-		return
-	}
+	defer c.Close()
 
-	handleAuthenticatedClient(conn, name)
+	go readWS(c)
+	go writeWS(c)
+
+	select {}
 }
 
-func handleAuthenticatedClient(conn net.Conn, name string) {
+func readWS(c *websocket.Conn) {
 	for {
-		buf := make([]byte, 128)
-		n, err := conn.Read(buf)
+		_, message, err := c.ReadMessage()
 		if err != nil {
-			log.Printf("Error ocurred while reading: %v", err)
-			return
-		} else {
-			log.Printf("Received from: %v data: %v", name, string(buf[:n]))
+			log.Println("read:", err)
+			break
 		}
+		log.Printf("recv: %s", message)
+		// err = c.WriteMessage(mt, message)
+		if err != nil {
+			log.Println("write:", err)
+			break
+		}
+	}
+}
+
+func writeWS(c *websocket.Conn) {
+	for {
+		err := c.WriteMessage(websocket.TextMessage, []byte("Pong"))
+		if err != nil {
+			log.Printf("Some error ocurred ponging: %v", err)
+			return
+		}
+
+		log.Println("Sent: Pong")
+
+		time.Sleep(5 * time.Second)
 	}
 }
