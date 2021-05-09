@@ -13,11 +13,13 @@ import (
 	pb "github.com/smartcontractkit/sync/sync"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
 var (
 	serverAddr = flag.String("server_addr", "localhost:10000", "The server address in the format of host:port")
+	accessKey  = flag.String("access_key", "", "The Access Key")
 )
 
 func main() {
@@ -58,6 +60,9 @@ func main() {
 // runSync establishes a bidirectional stream to the server
 func runSync(client pb.SyncClient, done chan struct{}) {
 	ctx := context.Background()
+	// header := metadata.Pairs("AccessKey", "abc")
+	// grpc.SendHeader(ctx, header)
+	ctx = metadata.AppendToOutgoingContext(ctx, "AccessKey", *accessKey)
 
 	// WaitForReady waits until the connection is reestablished before it
 	// initializes a stream
