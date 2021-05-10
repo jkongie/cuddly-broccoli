@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/smartcontractkit/sync/keys"
 	"github.com/smartcontractkit/sync/wsrpc"
@@ -38,5 +39,39 @@ func main() {
 		panic("copying public key failed")
 	}
 
-	wsrpc.Dial("127.0.0.1:1337", wsrpc.WithTransportCreds(privKey, pubStaticServer))
+	cl, err := wsrpc.Dial("127.0.0.1:1337", wsrpc.WithTransportCreds(privKey, pubStaticServer))
+	if err != nil {
+		log.Fatalln(err)
+	}
+	defer cl.CloseConn()
+
+	go writeClientWS(cl)
+	go readClientWS(cl)
+
+	select {}
+}
+
+func writeClientWS(c *wsrpc.Client) {
+	for {
+		err := c.Send("Ping")
+		if err != nil {
+			log.Printf("Some error ocurred pinging: %v", err)
+			return
+		}
+
+		log.Println("Sent: Ping")
+
+		time.Sleep(5 * time.Second)
+	}
+}
+
+func readClientWS(c *wsrpc.Client) {
+	ch := make(chan string)
+	c.Receive(ch)
+
+	for {
+		message := <-ch
+
+		log.Printf("recv: %s", message)
+	}
 }

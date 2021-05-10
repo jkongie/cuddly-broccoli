@@ -1,5 +1,11 @@
 package keys
 
+import (
+	"crypto/ed25519"
+	"encoding/hex"
+	"errors"
+)
+
 type Client struct {
 	Name               string
 	PubKey             string
@@ -34,6 +40,28 @@ var Clients = []Client{
 		RegisteredOnServer: false,
 	},
 }
+
+func FromHex(keyHex string) []byte {
+	privKey := make([]byte, hex.DecodedLen(len(keyHex)))
+	hex.Decode(privKey, []byte(keyHex))
+
+	return privKey
+}
+
+// ToStaticSizedBytes convert bytes to a statically sized byte array of the
+// of ed25519.PublicKeySize
+func ToStaticSizedBytes(b []byte) ([ed25519.PublicKeySize]byte, error) {
+	var sb [ed25519.PublicKeySize]byte
+
+	if ed25519.PublicKeySize != copy(sb[:], b) {
+		return sb, errors.New("copying public key failed")
+	}
+
+	return sb, nil
+}
+
+// Copy the pub key into a statically sized byte array
+var staticClientPubKey [ed25519.PublicKeySize]byte
 
 // _, privServer, _ := ed25519.GenerateKey(nil)
 

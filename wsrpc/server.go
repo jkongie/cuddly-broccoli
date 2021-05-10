@@ -5,7 +5,7 @@ package wsrpc
 
 import (
 	"crypto/ed25519"
-	"crypto/tls"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -15,12 +15,36 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+var ErrNotConnected = errors.New("client not connected")
+
+const (
+	// Time allowed to write a message to the peer.
+	writeWait = 10 * time.Second
+
+	// Time allowed to read the next pong message from the peer.
+	pongWait = 60 * time.Second
+
+	// Send pings to peer with this period. Must be less than pongWait.
+	pingPeriod = (pongWait * 9) / 10
+
+	//
+	defaultWriteBufSize = 1024
+
+	//
+	defaultReadBufSize = 1024
+)
+
 // A ServerOption sets options such as credentials, codec and keepalive parameters, etc.
 type ServerOption interface {
 	apply(*serverOptions)
 }
 
 type serverOptions struct {
+	// Buffer
+	writeBufferSize int
+	readBufferSize  int
+
+	// Transport Credentials
 	privKey          ed25519.PrivateKey
 	clientIdentities map[[ed25519.PublicKeySize]byte]string
 }
@@ -49,16 +73,28 @@ func Creds(privKey ed25519.PrivateKey, clientIdentities map[[ed25519.PublicKeySi
 	})
 }
 
-type Server struct {
-	opts serverOptions
+// Buffer returns a ServerOption that sets buffer options
+func Buffer(readSize int, writeSize int) ServerOption {
+	return newFuncServerOption(func(o *serverOptions) {
+		o.readBufferSize = readSize
+		o.writeBufferSize = writeSize
+	})
 }
 
 var defaultServerOptions = serverOptions{
-	// maxReceiveMessageSize: defaultServerMaxReceiveMessageSize,
-	// maxSendMessageSize:    defaultServerMaxSendMessageSize,
-	// connectionTimeout:     120 * time.Second,
-	// writeBufferSize:       defaultWriteBufSize,
-	// readBufferSize:        defaultReadBufSize,
+	writeBufferSize: defaultWriteBufSize,
+	readBufferSize:  defaultReadBufSize,
+}
+
+type Server struct {
+	opts serverOptions
+	// Inbound messages from the clients.
+	broadcast chan []byte
+	// Holds a list of the open connections mapped to a buffered channel of
+	// outbound messages.
+	connections map[[ed25519.PublicKeySize]byte]chan []byte
+	// Parameters for upgrading a websocket connection
+	upgrader websocket.Upgrader
 }
 
 func NewServer(opt ...ServerOption) *Server {
@@ -69,84 +105,136 @@ func NewServer(opt ...ServerOption) *Server {
 
 	s := &Server{
 		opts: opts,
+		upgrader: websocket.Upgrader{
+			ReadBufferSize:  opts.readBufferSize,
+			WriteBufferSize: opts.writeBufferSize,
+		},
+		connections: map[[ed25519.PublicKeySize]byte]chan []byte{},
+		broadcast:   make(chan []byte),
 	}
 
 	return s
 }
 
 func (s *Server) Serve(lis net.Listener) {
-	cert := newMinimalX509CertFromPrivateKey(s.opts.privKey)
-
-	tlsConfig := tls.Config{
-		Certificates: []tls.Certificate{cert},
-		ClientAuth:   tls.RequireAnyClientCert,
-
-		// Since our clients use self-signed certs, we skip verficiation here.
-		// Instead, we use VerifyPeerCertificate for our own check
-		InsecureSkipVerify: true,
-
-		MaxVersion: tls.VersionTLS13,
-		MinVersion: tls.VersionTLS13,
-
-		VerifyPeerCertificate: verifyCertMatchesIdentity(s.opts.clientIdentities),
-	}
+	tlsConfig := NewServerTLSConfig(s.opts.privKey, s.opts.clientIdentities)
 
 	httpsrv := &http.Server{
 		TLSConfig: &tlsConfig,
 	}
-	http.HandleFunc("/", wshandler)
-
-	// The TLS config is store on the http.Server struct
+	http.HandleFunc("/", s.wshandler)
 	httpsrv.ServeTLS(lis, "", "")
 }
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:   1024,
-	WriteBufferSize:  1024,
-	HandshakeTimeout: 45 * time.Second,
-}
-
-func wshandler(w http.ResponseWriter, r *http.Request) {
+func (s *Server) wshandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Println("Establishing Websocket connection")
-	c, err := upgrader.Upgrade(w, r, nil)
+
+	// Ensure there is only a single connection per public key
+	pk, err := pubKeyFromCert(r.TLS.PeerCertificates[0])
+	if err != nil {
+		log.Print("error: ", err)
+		return
+	}
+
+	if _, ok := s.connections[pk]; ok {
+		log.Println("error: You can only have one connection")
+
+		return
+	}
+
+	c, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Print("upgrade:", err)
 		return
 	}
 	defer c.Close()
 
-	go readWS(c)
-	go writeWS(c)
+	// Set up a channel to send messages and register it to the connection
+	// TODO - Protect with mutex?
+	sendCh := make(chan []byte)
+	s.connections[pk] = sendCh
+
+	// go readWS(c)
+	go s.readPump(c)
+	go s.writePump(c, sendCh)
 
 	select {}
 }
 
-func readWS(c *websocket.Conn) {
+func (s *Server) Send(pub [32]byte, message []byte) error {
+	// Find the connection
+	ch, ok := s.connections[pub]
+	if !ok {
+		return ErrNotConnected
+	}
+
+	// Send the message to the channel
+	ch <- message
+
+	return nil
+}
+
+func (s *Server) Broadcast() <-chan []byte {
+	return s.broadcast
+}
+
+// readPump pumps messages from the websocket connection.
+//
+// The application runs readPump in a per-connection goroutine. The application
+// ensures that there is at most one reader on a connection by executing all
+// reads from this goroutine.
+func (s *Server) readPump(conn *websocket.Conn) {
+	defer func() {
+		// c.hub.unregister <- c
+		conn.Close()
+	}()
+	// c.conn.SetReadLimit(maxMessageSize)
+	// c.conn.SetReadDeadline(time.Now().Add(pongWait))
+	// c.conn.SetPongHandler(func(string) error { c.conn.SetReadDeadline(time.Now().Add(pongWait)); return nil })
 	for {
-		_, message, err := c.ReadMessage()
+		_, message, err := conn.ReadMessage()
 		if err != nil {
-			log.Println("read:", err)
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("error: %v", err)
+			}
 			break
 		}
-		log.Printf("recv: %s", message)
-		// err = c.WriteMessage(mt, message)
-		if err != nil {
-			log.Println("write:", err)
-			break
-		}
+		s.broadcast <- message
 	}
 }
 
-func writeWS(c *websocket.Conn) {
+// writePump pumps messages from the server to the websocket connection.
+//
+// A goroutine running writePump is started for each connection. The
+// server ensures that there is at most one writer to a connection by
+// executing all writes from this goroutine.
+func (s *Server) writePump(conn *websocket.Conn, ch <-chan []byte) {
+	// ticker := time.NewTicker(pingPeriod)
+	defer func() {
+		// ticker.Stop()
+		conn.Close()
+	}()
+
 	for {
-		err := c.WriteMessage(websocket.TextMessage, []byte("Pong"))
-		if err != nil {
-			log.Printf("Some error ocurred ponging: %v", err)
-			return
+		select {
+		case message, ok := <-ch:
+			conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if !ok {
+				// Closed the channel.
+				conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+
+			err := conn.WriteMessage(websocket.TextMessage, message)
+			if err != nil {
+				log.Printf("Some error ocurred writing: %v", err)
+				return
+			}
+			// case <-ticker.C:
+			// 	conn.SetWriteDeadline(time.Now().Add(writeWait))
+			// 	if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+			// 		return
+			// 	}
 		}
-
-		log.Println("Sent: Pong")
-
-		time.Sleep(5 * time.Second)
 	}
 }

@@ -68,7 +68,7 @@ func defaultDialOptions() dialOptions {
 	}
 }
 
-func Dial(target string, opts ...DialOption) {
+func Dial(target string, opts ...DialOption) (*Client, error) {
 	cc := &ClientConn{
 		target: target,
 		dopts:  defaultDialOptions(),
@@ -106,42 +106,37 @@ func Dial(target string, opts ...DialOption) {
 		log.Fatal(err, resp)
 	}
 
-	go writeClientWS(wsconn)
-	go readClientWS(wsconn)
-
-	defer wsconn.Close()
-
-	select {}
-
-	// return cc, nil
+	return &Client{wsconn}, nil
 }
 
-func writeClientWS(conn *websocket.Conn) {
-	for {
-		err := conn.WriteMessage(websocket.TextMessage, []byte("Ping"))
-		if err != nil {
-			log.Printf("Some error ocurred pinging: %v", err)
-			return
-		}
-
-		log.Println("Sent: Ping")
-
-		time.Sleep(5 * time.Second)
-	}
+type Client struct {
+	conn *websocket.Conn
 }
 
-func readClientWS(c *websocket.Conn) {
-	for {
-		_, message, err := c.ReadMessage()
-		if err != nil {
-			log.Println("read:", err)
-			break
-		}
-		log.Printf("recv: %s", message)
-		// err = c.WriteMessage(mt, message)
-		if err != nil {
-			log.Println("write:", err)
-			break
-		}
+func (c *Client) Send(message string) error {
+	err := c.conn.WriteMessage(websocket.TextMessage, []byte("Ping"))
+	if err != nil {
+		return err
 	}
+	return nil
+}
+
+func (c *Client) Receive(ch chan string) {
+	go func() {
+		for {
+			_, message, err := c.conn.ReadMessage()
+			if err != nil {
+				// Should gracefully close the connection if we detect that the
+				// connection is no longer active
+				log.Println("read:", err)
+				break
+			}
+
+			ch <- string(message)
+		}
+	}()
+}
+
+func (c *Client) CloseConn() {
+	c.conn.Close()
 }
