@@ -66,12 +66,8 @@ func writeClientWS(c *wsrpc.Client) {
 }
 
 func readClientWS(c *wsrpc.Client) {
-	ch := make(chan string)
-	c.Receive(ch)
-
-	for {
-		message := <-ch
-
-		log.Printf("recv: %s", message)
-	}
+	// ch := make(chan string)
+	c.Receive(func(msg []byte) {
+		log.Printf("recv: %s", string(msg))
+	})
 }
