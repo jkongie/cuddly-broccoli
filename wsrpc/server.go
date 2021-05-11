@@ -6,7 +6,6 @@ package wsrpc
 import (
 	"crypto/ed25519"
 	"errors"
-	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -127,7 +126,7 @@ func (s *Server) Serve(lis net.Listener) {
 }
 
 func (s *Server) wshandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Println("Establishing Websocket connection")
+	log.Println("Establishing Websocket connection")
 
 	// Ensure there is only a single connection per public key
 	pk, err := pubKeyFromCert(r.TLS.PeerCertificates[0])
@@ -154,9 +153,8 @@ func (s *Server) wshandler(w http.ResponseWriter, r *http.Request) {
 	sendCh := make(chan []byte)
 	s.connections[pk] = sendCh
 
-	// go readWS(c)
 	go s.readPump(c)
-	go s.writePump(c, sendCh)
+	go s.writePump(c, pk, sendCh)
 
 	select {}
 }
@@ -208,7 +206,7 @@ func (s *Server) readPump(conn *websocket.Conn) {
 // A goroutine running writePump is started for each connection. The
 // server ensures that there is at most one writer to a connection by
 // executing all writes from this goroutine.
-func (s *Server) writePump(conn *websocket.Conn, ch <-chan []byte) {
+func (s *Server) writePump(conn *websocket.Conn, pk [ed25519.PublicKeySize]byte, ch <-chan []byte) {
 	// ticker := time.NewTicker(pingPeriod)
 	defer func() {
 		// ticker.Stop()
@@ -228,6 +226,10 @@ func (s *Server) writePump(conn *websocket.Conn, ch <-chan []byte) {
 			err := conn.WriteMessage(websocket.TextMessage, message)
 			if err != nil {
 				log.Printf("Some error ocurred writing: %v", err)
+
+				// Remove the connection from the channel
+				delete(s.connections, pk)
+
 				return
 			}
 			// case <-ticker.C:

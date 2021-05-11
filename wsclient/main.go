@@ -5,7 +5,9 @@ import (
 	"encoding/hex"
 	"log"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/smartcontractkit/sync/keys"
@@ -39,24 +41,33 @@ func main() {
 		panic("copying public key failed")
 	}
 
-	cl, err := wsrpc.Dial("127.0.0.1:1337", wsrpc.WithTransportCreds(privKey, pubStaticServer))
+	conn, err := wsrpc.Dial("127.0.0.1:1337", wsrpc.WithTransportCreds(privKey, pubStaticServer))
 	if err != nil {
 		log.Fatalln(err)
 	}
-	defer cl.CloseConn()
+	defer conn.Close()
 
-	go writeClientWS(cl)
-	go readClientWS(cl)
+	go writeClientWS(conn)
+	conn.RegisterHandler(readHandler)
 
-	select {}
+	sigs := make(chan os.Signal, 1)
+	done := make(chan bool, 1)
+
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		<-sigs
+		done <- true
+	}()
+
+	<-done
 }
 
-func writeClientWS(c *wsrpc.Client) {
+func writeClientWS(c *wsrpc.ClientConn) {
 	for {
 		err := c.Send("Ping")
 		if err != nil {
 			log.Printf("Some error ocurred pinging: %v", err)
-			return
 		}
 
 		log.Println("Sent: Ping")
@@ -65,9 +76,6 @@ func writeClientWS(c *wsrpc.Client) {
 	}
 }
 
-func readClientWS(c *wsrpc.Client) {
-	// ch := make(chan string)
-	c.Receive(func(msg []byte) {
-		log.Printf("recv: %s", string(msg))
-	})
+func readHandler(msg []byte) {
+	log.Printf("recv: %s", string(msg))
 }

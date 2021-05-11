@@ -28,6 +28,24 @@ func NewServerTLSConfig(priv ed25519.PrivateKey, clientIdentities map[[32]byte]s
 	}
 }
 
+func NewClientTLSConfig(priv ed25519.PrivateKey, serverIdentities map[[32]byte]string) tls.Config {
+	cert := newMinimalX509CertFromPrivateKey(priv)
+
+	return tls.Config{
+		Certificates: []tls.Certificate{cert},
+
+		MaxVersion: tls.VersionTLS13,
+		MinVersion: tls.VersionTLS13,
+
+		// We pin the self-signed server public key rn.
+		// If we wanted to use a proper CA for the server public key,
+		// InsecureSkipVerify and VerifyPeerCertificate should be
+		// removed. (See also discussion in README.md)
+		InsecureSkipVerify:    true,
+		VerifyPeerCertificate: verifyCertMatchesIdentity(serverIdentities),
+	}
+}
+
 // Generates a minimal certificate (that wouldn't be considered valid outside this telemetry networking protocol)
 // from an Ed25519 private key.
 func newMinimalX509CertFromPrivateKey(sk ed25519.PrivateKey) tls.Certificate {
