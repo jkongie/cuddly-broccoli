@@ -2,12 +2,15 @@ package wsrpc
 
 import (
 	"context"
-	"crypto/ed25519"
 	"errors"
-	"fmt"
 	"log"
 	"sync"
+	"time"
+
+	"github.com/smartcontractkit/sync/wsrpc/internal/backoff"
 )
+
+// TODO - Figure out how to deal with write/read deadlines
 
 var (
 	// errConnClosing indicates that the connection is closing.
@@ -19,84 +22,33 @@ var (
 //
 type ClientConn struct {
 	ctx context.Context
-	// cancel context.CancelFunc
-
-	mu sync.RWMutex
+	mu  sync.RWMutex
 
 	target string
-
-	// Manage connection state - Needed?
-	csMgr *connectivityStateManager
-	csCh  <-chan ConnectivityState
+	csCh   <-chan ConnectivityState
 
 	dopts dialOptions
 	conn  *addrConn
 
+	// readFn contains the registered handler for reading messages
 	readFn func(message []byte)
 }
 
-// dialOptions configure a Dial call. dialOptions are set by the DialOption
-// values passed to Dial.
-type dialOptions struct {
-	copts        ConnectOptions
-	privKey      ed25519.PrivateKey
-	serverPubKey [ed25519.PublicKeySize]byte
-}
-
-// DialOption configures how we set up the connection.
-type DialOption interface {
-	apply(*dialOptions)
-}
-
-// funcDialOption wraps a function that modifies dialOptions into an
-// implementation of the DialOption interface.
-type funcDialOption struct {
-	f func(*dialOptions)
-}
-
-func (fdo *funcDialOption) apply(do *dialOptions) {
-	fdo.f(do)
-}
-
-func newFuncDialOption(f func(*dialOptions)) *funcDialOption {
-	return &funcDialOption{
-		f: f,
-	}
-}
-
-// WithTransportCredentials returns a DialOption which configures a connection
-// level security credentials (e.g., TLS/SSL).
-func WithTransportCreds(privKey ed25519.PrivateKey, serverPubKey [ed25519.PublicKeySize]byte) DialOption {
-	return newFuncDialOption(func(o *dialOptions) {
-		o.copts.TransportCredentials = NewTransportCredentials(
-			privKey,
-			map[[ed25519.PublicKeySize]byte]string{
-				serverPubKey: "server",
-			},
-		)
-	})
-}
-
-func defaultDialOptions() dialOptions {
-	return dialOptions{
-		copts: ConnectOptions{
-			// 	WriteBufferSize: defaultWriteBufSize,
-			// 	ReadBufferSize:  defaultReadBufSize,
-		},
-	}
-}
-
+// Dial creates a client connection to the given target.
 func Dial(target string, opts ...DialOption) (*ClientConn, error) {
 	cc := &ClientConn{
 		ctx:    context.Background(),
 		target: target,
-		csMgr:  &connectivityStateManager{},
 		dopts:  defaultDialOptions(),
 	}
 
 	for _, opt := range opts {
 		opt.apply(&cc.dopts)
 	}
+
+	// Set the backoff strategy. We may need to consider making this
+	// customizable in the dial options.
+	cc.dopts.bs = backoff.DefaultExponential
 
 	addrConn, err := cc.newAddrConn(target)
 	if err != nil {
@@ -109,7 +61,7 @@ func Dial(target string, opts ...DialOption) (*ClientConn, error) {
 	return cc, nil
 }
 
-// newAddrConn creates an addrConn for addrs and adds it to cc.conns.
+// newAddrConn creates an addrConn for the addr and sets it to cc.conn.
 func (cc *ClientConn) newAddrConn(addr string) (*addrConn, error) {
 	csCh := make(chan ConnectivityState)
 	ac := &addrConn{
@@ -121,7 +73,7 @@ func (cc *ClientConn) newAddrConn(addr string) (*addrConn, error) {
 
 		// resetBackoff: make(chan struct{}),
 	}
-	// ac.ctx, ac.cancel = context.WithCancel(cc.ctx)
+	ac.ctx, ac.cancel = context.WithCancel(cc.ctx)
 	// Track ac in cc. This needs to be done before any getTransport(...) is called.
 	cc.mu.Lock()
 	// if cc.conn == nil {
@@ -139,6 +91,7 @@ func (cc *ClientConn) newAddrConn(addr string) (*addrConn, error) {
 	return ac, nil
 }
 
+// TODO - Rename
 // listen for the connectivty state to be ready and enable the handler
 // TODO - Shutdown the routine during when the client is closed
 func (cc *ClientConn) listen() {
@@ -158,6 +111,7 @@ func (cc *ClientConn) listen() {
 	}
 }
 
+// TODO - Rename
 func (cc *ClientConn) startRead(done <-chan struct{}) {
 	for {
 		select {
@@ -170,26 +124,15 @@ func (cc *ClientConn) startRead(done <-chan struct{}) {
 	}
 }
 
-// GetState returns the connectivity.State of ClientConn.
-func (cc *ClientConn) GetState() ConnectivityState {
-	return cc.csMgr.getState()
-}
-
 // Close tears down the ClientConn and all underlying connections.
 func (cc *ClientConn) Close() {
-	log.Println("Closing client connection")
-
 	conn := cc.conn
 
+	cc.mu.Lock()
 	cc.conn = nil
-	cc.csMgr.updateState(ConnectivityStateShutdown)
+	cc.mu.Unlock()
 
-	// Close the websocket connection
-	// Take another look at this. We may not want to do this here.
-	// We could inspect shutdown state
-	if conn.transport != nil {
-		conn.transport.Close()
-	}
+	conn.teardown()
 }
 
 // TODO - Figure out a way to return errors
@@ -203,16 +146,15 @@ func (cc *ClientConn) Send(message string) error {
 	return nil
 }
 
-// func (cc *ClientConn) Receive(handler func(message []byte)) {
-// 	cc.conn.transport.Read(handler)
-// }
-
 func (cc *ClientConn) RegisterHandler(handler func(message []byte)) {
 	cc.readFn = handler
 }
 
 // addrConn is a network connection to a given address.
 type addrConn struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+
 	cc *ClientConn
 
 	addr  string
@@ -263,92 +205,108 @@ func (ac *addrConn) updateConnectivityState(s ConnectivityState, lastErr error) 
 	}
 	ac.state = s
 	ac.stateCh <- s
-	fmt.Println("Set Connectivity State to ", s)
+	log.Printf("[AddrConn] Connectivity State: %s", s)
 }
 
 func (ac *addrConn) resetTransport() {
-	ac.mu.Lock()
-	if ac.state == ConnectivityStateShutdown {
-		ac.mu.Unlock()
-		return
-	}
-
-	// addrs := ac.addrs
-	// backoffFor := ac.dopts.bs.Backoff(ac.backoffIdx)
-	// // This will be the duration that dial gets to finish.
-	// dialDuration := minConnectTimeout
-	// if ac.dopts.minConnectTimeout != nil {
-	// 	dialDuration = ac.dopts.minConnectTimeout()
-	// }
-
-	addr := ac.addr
-	copts := ac.dopts.copts
-
-	ac.updateConnectivityState(ConnectivityStateConnecting, nil)
-	ac.transport = nil
-	ac.mu.Unlock()
-
-	newTr, err := ac.createTransport(addr, copts)
-	if err != nil {
-		// After connection failure, the addrConn enters TRANSIENT_FAILURE.
+	for i := 0; ; i++ {
 		ac.mu.Lock()
 		if ac.state == ConnectivityStateShutdown {
 			ac.mu.Unlock()
 			return
 		}
-		ac.updateConnectivityState(ConnectivityStateTransientFailure, err)
 
-		// Backoff.
-		// b := ac.resetBackoff
+		backoffFor := ac.dopts.bs.NextBackOff()
+		addr := ac.addr
+		copts := ac.dopts.copts
+
+		ac.updateConnectivityState(ConnectivityStateConnecting, nil)
+		ac.transport = nil
 		ac.mu.Unlock()
 
-		// timer := time.NewTimer(backoffFor)
-		// select {
-		// case <-timer.C:
-		// 	ac.mu.Lock()
-		// 	ac.backoffIdx++
-		// 	ac.mu.Unlock()
-		// case <-b:
-		// 	timer.Stop()
-		// case <-ac.ctx.Done():
-		// 	timer.Stop()
-		// 	return
-		// }
-		// continue
+		newTr, reconnect, err := ac.createTransport(addr, copts)
+		if err != nil {
+			// After connection failure, the addrConn enters TRANSIENT_FAILURE.
+			ac.mu.Lock()
+			if ac.state == ConnectivityStateShutdown {
+				ac.mu.Unlock()
+				return
+			}
+			ac.updateConnectivityState(ConnectivityStateTransientFailure, err)
+			ac.mu.Unlock()
 
-		return
-	}
+			// Backoff.
+			timer := time.NewTimer(backoffFor)
+			log.Printf("[AddrConn] Waiting %s to reconnect", backoffFor)
+			select {
+			case <-timer.C:
+			// case <-b:
+			// 	timer.Stop()
+			case <-ac.ctx.Done():
+				timer.Stop()
+				return
+			}
+			continue
+		}
 
-	// Close the transport if in a shutdown state
-	ac.mu.Lock()
-	if ac.state == ConnectivityStateShutdown {
+		// Close the transport if in a shutdown state
+		ac.mu.Lock()
+		if ac.state == ConnectivityStateShutdown {
+			ac.mu.Unlock()
+			newTr.Close()
+			return
+		}
+		ac.transport = newTr
+		ac.dopts.bs.Reset()
+
+		ac.updateConnectivityState(ConnectivityStateReady, nil)
+
 		ac.mu.Unlock()
-		newTr.Close()
-		return
+
+		// Block until the created transport is down. When this happens, we
+		// attempt to reconnect by starting again from the top
+		<-reconnect.Done()
+		// hcancel()
 	}
-	ac.transport = newTr
-	ac.updateConnectivityState(ConnectivityStateReady, nil)
-
-	return
-
-	// TODO
-	// Block until the created transport is down. And when this happens,
-	// we restart from the top of the addr list.
-	// <-reconnect.Done()
-	// hcancel()
-	// restart connecting - the top of the loop will set state to
-	// CONNECTING.  This is against the current connectivity semantics doc,
-	// however it allows for graceful behavior for RPCs not yet dispatched
-	// - unfortunate timing would otherwise lead to the RPC failing even
-	// though the TRANSIENT_FAILURE state (called for by the doc) would be
-	// instantaneous.
-	//
-	// Ideally we should transition to Idle here and block until there is
-	// RPC activity that leads to the balancer requesting a reconnect of
-	// the associated SubConn.
 
 }
 
-func (ac *addrConn) createTransport(addr string, copts ConnectOptions) (ClientTransport, error) {
-	return NewWebsocketClient(ac.cc.ctx, addr, copts)
+func (ac *addrConn) createTransport(addr string, copts ConnectOptions) (ClientTransport, *Event, error) {
+	reconnect := NewEvent()
+	once := sync.Once{}
+
+	// Called when the transport closes
+	onClose := func() {
+		ac.mu.Lock()
+		once.Do(func() {
+			if ac.state == ConnectivityStateReady {
+				ac.updateConnectivityState(ConnectivityStateIdle, nil)
+			}
+		})
+		ac.mu.Unlock()
+		// close(onCloseCalled)
+		reconnect.Fire()
+	}
+
+	tr, err := NewWebsocketClient(ac.cc.ctx, addr, copts, onClose)
+
+	return tr, reconnect, err
+}
+
+// tearDown starts to tear down the addrConn.
+func (ac *addrConn) teardown() {
+	ac.mu.Lock()
+
+	if ac.state == ConnectivityStateShutdown {
+		ac.mu.Unlock()
+		return
+	}
+
+	curTr := ac.transport
+	ac.transport = nil
+
+	ac.cancel()
+	curTr.Close()
+
+	ac.mu.Unlock()
 }

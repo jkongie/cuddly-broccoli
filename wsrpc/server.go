@@ -6,6 +6,7 @@ package wsrpc
 import (
 	"crypto/ed25519"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -153,7 +154,7 @@ func (s *Server) wshandler(w http.ResponseWriter, r *http.Request) {
 	sendCh := make(chan []byte)
 	s.connections[pk] = sendCh
 
-	go s.readPump(c)
+	go s.readPump(c, pk)
 	go s.writePump(c, pk, sendCh)
 
 	select {}
@@ -181,22 +182,37 @@ func (s *Server) Broadcast() <-chan []byte {
 // The application runs readPump in a per-connection goroutine. The application
 // ensures that there is at most one reader on a connection by executing all
 // reads from this goroutine.
-func (s *Server) readPump(conn *websocket.Conn) {
+func (s *Server) readPump(conn *websocket.Conn, pk [ed25519.PublicKeySize]byte) {
 	defer func() {
 		// c.hub.unregister <- c
 		conn.Close()
 	}()
 	// c.conn.SetReadLimit(maxMessageSize)
 	// c.conn.SetReadDeadline(time.Now().Add(pongWait))
-	// c.conn.SetPongHandler(func(string) error { c.conn.SetReadDeadline(time.Now().Add(pongWait)); return nil })
+	// conn.SetPongHandler(func(string) error {
+	// 	fmt.Println("Received Ping")
+	// 	conn.SetReadDeadline(time.Now().Add(pongWait))
+	// 	return nil
+	// })
+
+	conn.SetPingHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
+
 	for {
 		_, message, err := conn.ReadMessage()
 		if err != nil {
+			fmt.Println(err)
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				// Remove the connection from the channel
+				delete(s.connections, pk)
+
 				log.Printf("error: %v", err)
 			}
 			break
 		}
+
 		s.broadcast <- message
 	}
 }

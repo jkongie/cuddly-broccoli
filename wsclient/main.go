@@ -67,15 +67,15 @@ func writeClientWS(c *wsrpc.ClientConn) {
 	for {
 		err := c.Send("Ping")
 		if err != nil {
-			log.Printf("Some error ocurred pinging: %v", err)
+			log.Printf("[MAIN] Some error ocurred pinging: %v", err)
+		} else {
+			log.Println("[MAIN] Sent: Ping")
 		}
-
-		log.Println("Sent: Ping")
 
 		time.Sleep(5 * time.Second)
 	}
 }
 
 func readHandler(msg []byte) {
-	log.Printf("recv: %s", string(msg))
+	log.Printf("[MAIN] recv: %s", string(msg))
 }

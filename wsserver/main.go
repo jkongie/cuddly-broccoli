@@ -30,7 +30,7 @@ func main() {
 
 	lis, err := net.Listen("tcp", "127.0.0.1:1337")
 	if err != nil {
-		log.Fatalf("failed to listen: %v", err)
+		log.Fatalf("[MAIN] failed to listen: %v", err)
 	}
 	s := wsrpc.NewServer(wsrpc.Creds(privKey, clientIdentities))
 	go s.Serve(lis)
@@ -44,7 +44,7 @@ func main() {
 func receiveMessages(ch <-chan []byte) {
 	for {
 		message := <-ch
-		log.Printf("received: %s", message)
+		log.Printf("[MAIN] received: %s", message)
 	}
 }
 
@@ -56,15 +56,15 @@ func sendMessages(s *wsrpc.Server, clientIdentities map[[ed25519.PublicKeySize]b
 			err := s.Send(pubKey, []byte("Pong"))
 			if err != nil {
 				if errors.Is(err, wsrpc.ErrNotConnected) {
-					log.Printf("%s: %v", name, err)
+					log.Printf("[MAIN] %s: %v", name, err)
 				} else {
-					log.Printf("Some error ocurred ponging: %v", err)
+					log.Printf("[MAIN] Some error ocurred ponging: %v", err)
 				}
 
 				continue
 			}
 
-			log.Printf("Sent: Pong to %s", name)
+			log.Printf("[MAIN] Sent: Pong to %s", name)
 		}
 
 		time.Sleep(5 * time.Second)

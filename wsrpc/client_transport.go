@@ -30,9 +30,6 @@ type ConnectOptions struct {
 	// connection. Only one of TransportCredentials and CredsBundle is non-nil.
 	TransportCredentials TransportCredentials
 
-	// KeepaliveParams stores the keepalive parameters.
-	// KeepaliveParams keepalive.ClientParameters
-
 	// WriteBufferSize sets the size of write buffer which in turn determines how much data can be batched before it's written on the wire.
 	WriteBufferSize int
 	// ReadBufferSize sets the size of read buffer, which in turn determines how much data can be read at most for one read syscall.
@@ -66,7 +63,8 @@ type WebsocketClient struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	conn *websocket.Conn // underlying communication channel
+	conn    *websocket.Conn // underlying communication channel
+	onClose func()
 
 	write chan []byte
 	read  chan []byte
@@ -74,7 +72,7 @@ type WebsocketClient struct {
 
 // NewWebsocketClient establishes the transport with the required ConnectOptions
 // and returns it to the caller.
-func NewWebsocketClient(ctx context.Context, addr string, opts ConnectOptions) (_ *WebsocketClient, err error) {
+func NewWebsocketClient(ctx context.Context, addr string, opts ConnectOptions, onClose func()) (_ *WebsocketClient, err error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer func() {
 		if err != nil {
@@ -95,11 +93,12 @@ func NewWebsocketClient(ctx context.Context, addr string, opts ConnectOptions) (
 	}
 
 	c := &WebsocketClient{
-		ctx:    ctx,
-		cancel: cancel,
-		conn:   conn,
-		write:  make(chan []byte), // Should this be buffered?
-		read:   make(chan []byte), // Should this be buffered?
+		ctx:     ctx,
+		cancel:  cancel,
+		conn:    conn,
+		onClose: onClose,
+		write:   make(chan []byte), // Should this be buffered?
+		read:    make(chan []byte), // Should this be buffered?
 	}
 
 	// Start go routines to establish the read/write channels
@@ -111,6 +110,8 @@ func NewWebsocketClient(ctx context.Context, addr string, opts ConnectOptions) (
 
 func (c *WebsocketClient) Close() error {
 	fmt.Println("Calling websocket client close")
+	close(c.write)
+
 	return c.conn.Close()
 }
 
@@ -144,7 +145,7 @@ func (c *WebsocketClient) readPump() {
 		_, msg, err := c.conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("error: %v", err)
+				log.Printf("[Transport] Unexpected Close Error: %v", err)
 			}
 			break
 		}
@@ -158,29 +159,41 @@ func (c *WebsocketClient) readPump() {
 // that there is at most one writer to a connection by executing all writes
 // from this goroutine.
 func (c *WebsocketClient) writePump() {
+	ticker := time.NewTicker(pingPeriod)
 	defer func() {
+		c.onClose()
+		ticker.Stop()
 		c.cancel()
 	}()
 
 	// Pong Reply Handler
-	// c.conn.SetPongHandler(func(string) error { c.conn.SetReadDeadline(time.Now().Add(pongWait)); return nil })
+	c.conn.SetPongHandler(func(string) error {
+		fmt.Println("Pong Handler")
+		c.conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
 
 	for {
 		select {
 		case msg, ok := <-c.write:
-			// May need to put this back in and set from connection options
-			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
-
 			// Closed the channel.
 			if !ok {
+				log.Println("[Transport] Sending close message to server")
 				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
 
 			// Write the message
+			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			err := c.conn.WriteMessage(websocket.TextMessage, msg)
 			if err != nil {
-				log.Printf("Some error ocurred writing: %v", err)
+				log.Printf("[Transport] Error ocurred writing: %v", err)
+				return
+			}
+		case <-ticker.C:
+			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				log.Printf("[Transport] Error ocurred pinging: %v", err)
 				return
 			}
 		}
